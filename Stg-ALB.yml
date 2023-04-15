@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description:
+  Create ALB or S3 Bucket
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------# 
+Parameters:
+  SystemName:
+    Description: "System name of each resource names."
+    Type: String
+    Default: "test"
+  EnvName:
+    Description: "Environment name of each resource names."
+    Type: String
+    Default: "prd"
+  HostZoneId:
+    Description: FQDN of the hosted zone
+    Type: AWS::Route53::HostedZone::Id
+    Default: "xxxxxxxxxxxxxxxx" #Route53 HostedZone ID
+  SubDomain:
+    Description: FQDN of the certificate
+    Type: String
+    Default: "xxxxxxxxxxxxxx" #domain address to be used
+  LoadBalancerCertificateARN:
+    Type: String
+    Default: "xxxxxxxxxxxxxxxxxxxx" #certificate ARN
+    Description: Enter certificate ARN; Use ACM to create a certificate before creating this stack
+# ------------------------------------------------------------#
+# Create S3 Bucket
+# ------------------------------------------------------------# 
+Resources:
+  ALBLogsBucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub ${SystemName}-${EnvName}-aws-alb-logs-bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: !Sub ${SystemName}-${EnvName}-aws-alb-logs-lifecycle
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub ${SystemName}-${EnvName}-aws-alb-logs-bucket
+        - Key: Env
+          Value: !Sub ${EnvName}
+# ------------------------------------------------------------#
+# Create S3 Bucket
+# ------------------------------------------------------------# 
+  ELBLogBucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref ALBLogsBucket
+      PolicyDocument:
+        Id: "AWSCFn-AccessLogs-Policy-20180920"
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AlbLogs"
+            Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+            Resource: !Sub arn:aws:s3:::${ALBLogsBucket}/AWSLogs/${AWS::AccountId}/* #${ALBLogsBucket}はパラメーターで作成できないので、hardcodedで適用
+            Principal:
+              AWS:
+                - "582318560864"
+# ------------------------------------------------------------#
+#  Target Group
+# ------------------------------------------------------------#
+  TargetGroupWeb001: 
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties: 
+      VpcId: 
+        Fn::ImportValue: !Sub ${EnvName}-vpc
+      Name: !Sub ${SystemName}-${EnvName}-web001-tgp
+      Protocol: HTTP
+      Port: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthyThresholdCount: 5 # 正常の閾値
+      UnhealthyThresholdCount: 2 # 非正常の閾値
+      HealthCheckTimeoutSeconds: 5 # タイムアウト
+      HealthCheckIntervalSeconds: 60 # 間隔
+      Matcher: 
+        HttpCode: 200 # 成功コード
+      Tags:
+        - Key: Name
+          Value: !Sub ${SystemName}-${EnvName}-web001-tgp
+        - Key: Env
+          Value: !Sub ${EnvName}
+      TargetGroupAttributes: 
+        - Key: "stickiness.enabled"
+          Value: false
+      Targets: 
+        - Id: 
+            Fn::ImportValue: !Sub ${EnvName}-web
+          Port: 80
+# ------------------------------------------------------------#
+#  internet-facing ALB
+# ------------------------------------------------------------#
+  InternetFacingALB: 
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties: 
+      Name: !Sub ${SystemName}-${EnvName}-web-alb
+      Tags: 
+        - Key: Name
+          Value: !Sub ${SystemName}-${EnvName}-web-alb
+        - Key: Env
+          Value: !Sub ${EnvName}
+      Scheme: "internet-facing"
+      LoadBalancerAttributes: 
+        - Key: "deletion_protection.enabled"
+          Value: true # trueに変更
+        - Key: access_logs.s3.enabled
+          Value: true
+        - Key: access_logs.s3.bucket
+          Value: !Ref ALBLogsBucket
+        - Key: "idle_timeout.timeout_seconds"
+          Value: 60
+      SecurityGroups:
+        - Fn::ImportValue: !Sub ${EnvName}-alb-sg
+      Subnets: 
+        - Fn::ImportValue: !Sub ${EnvName}-public-subnet-1a
+        - Fn::ImportValue: !Sub ${EnvName}-public-subnet-1c
+      Type: application
+  ALBListenerHTTPSWeb001:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref LoadBalancerCertificateARN
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroupWeb001
+          Type: forward
+      LoadBalancerArn: !Ref InternetFacingALB
+# ------------------------------------------------------------#
+#  Route53
+# ------------------------------------------------------------#
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Sub ${HostZoneId}
+      Comment: "DNS for ALB"
+      Name: !Sub ${SubDomain}
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt 'InternetFacingALB.CanonicalHostedZoneID'
+        DNSName: !GetAtt 'InternetFacingALB.DNSName'
